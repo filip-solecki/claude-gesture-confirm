@@ -2,11 +2,12 @@
 """
 Claude Code – Gesture Confirmation Hook
 ────────────────────────────────────────
-Double right wink (×2 within 1 s) → ALLOW
-Double left wink  (×2 within 1 s) → REJECT
-Natural blink (both eyes)          → ignored
-Click "Always allow"               → ALLOW + add to allowlist
-Timeout (30 s)                     → REJECT  (safe default)
+Double right wink (×2 within 1 s)   → ALLOW
+Double left wink  (×2 within 1 s)   → REJECT
+Both eyes closed for 1 s            → ALLOW + add to allowlist
+Natural blink (both eyes, < 1 s)    → ignored
+Click "Always allow"                → ALLOW + add to allowlist
+Timeout (30 s)                      → REJECT  (safe default)
 
 Allowlist stored in: ~/.claude/gesture_confirm_allowlist.json
   - Bash entries matched by exact command string
@@ -106,10 +107,11 @@ import tkinter as tk
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 TIMEOUT            = 30    # seconds before auto-reject if no gesture
-BLINK_THRESHOLD    = 0.35  # MediaPipe eyeBlink blendshape score → eye "closed"
+BLINK_CLOSE        = 0.40  # score rises above this → eye transitions to "closed"
+BLINK_OPEN         = 0.20  # score falls below this → eye transitions back to "open"
 WINK_OPEN_MAX      = 0.30  # the OTHER eye must stay below this to confirm a wink
 DOUBLE_WINK_WINDOW = 1.0   # max seconds between the two winks of a double-wink
-HOLD_ALWAYS_SECS   = 2.0   # seconds to hold right wink → always allow
+HOLD_ALWAYS_SECS   = 1.0   # seconds to hold both eyes closed → always allow
 MODEL_PATH         = os.path.expanduser("~/.claude/face_landmarker.task")
 
 # ── UI colours (dark theme) ───────────────────────────────────────────────────
@@ -125,12 +127,12 @@ DIM    = "#374151"
 result_q: "queue.Queue[str]" = queue.Queue()
 
 eye_state: dict = {
-    "face":      False,
-    "left":      None,
-    "right":     None,
-    "l_count":   0,
-    "r_count":   0,
-    "r_hold":    0.0,   # 0.0–1.0 progress toward always-allow hold
+    "face":       False,
+    "left":       None,
+    "right":      None,
+    "l_count":    0,
+    "r_count":    0,
+    "both_hold":  0.0,   # 0.0–1.0 progress toward always-allow (both eyes closed)
 }
 
 
@@ -167,10 +169,12 @@ def _detect() -> None:
         min_tracking_confidence=0.5,
     )
 
-    r_was_closed   = l_was_closed   = False
+    # Hysteresis state: eye is "closed" once score > BLINK_CLOSE,
+    # and stays closed until score < BLINK_OPEN. Prevents flickering.
+    r_closed = l_closed = False
     r_wink_count   = l_wink_count   = 0
     r_window_start = l_window_start = None
-    r_hold_start   = None   # when the current right-eye close started
+    both_hold_start = None   # when both eyes started being held closed
     t0 = time.time()
 
     try:
@@ -188,59 +192,62 @@ def _detect() -> None:
 
                 if not result.face_blendshapes:
                     eye_state.update(face=False, left=None, right=None,
-                                     r_count=0, l_count=0)
-                    r_was_closed = l_was_closed = False
+                                     r_count=0, l_count=0, both_hold=0.0)
+                    r_closed = l_closed = False
                     r_wink_count = l_wink_count = 0
                     r_window_start = l_window_start = None
+                    both_hold_start = None
                     continue
 
                 bs      = {b.category_name: b.score for b in result.face_blendshapes[0]}
                 l_score = bs.get("eyeBlinkLeft",  0.0)
                 r_score = bs.get("eyeBlinkRight", 0.0)
-                l_cls   = l_score > BLINK_THRESHOLD
-                r_cls   = r_score > BLINK_THRESHOLD
                 now     = time.time()
+
+                # Hysteresis: transition closed→open only when score drops below BLINK_OPEN
+                if r_closed:
+                    r_cls = r_score > BLINK_OPEN
+                else:
+                    r_cls = r_score > BLINK_CLOSE
+                if l_closed:
+                    l_cls = l_score > BLINK_OPEN
+                else:
+                    l_cls = l_score > BLINK_CLOSE
+                # Capture previous state before updating (needed for transition detection)
+                r_prev, l_prev = r_closed, l_closed
+                r_closed, l_closed = r_cls, l_cls
 
                 eye_state.update(face=True, left=l_cls, right=r_cls)
 
-                # Both eyes closed = natural blink → ignore
+                # ── Both eyes closed: short = natural blink, hold 1s = ALWAYS ALLOW ──
                 if l_cls and r_cls:
-                    r_was_closed = l_was_closed = False
-                    r_wink_count = l_wink_count = 0
-                    r_window_start = l_window_start = None
-                    eye_state["r_count"] = eye_state["l_count"] = 0
-                    continue
-
-                # ── Right eye: double-wink → ALLOW, hold 2s → ALWAYS ALLOW ──
-                r_winking = r_cls and l_score < WINK_OPEN_MAX
-                if r_winking:
-                    if r_hold_start is None:
-                        r_hold_start = now
-                    held = now - r_hold_start
-                    eye_state["r_hold"] = min(held / HOLD_ALWAYS_SECS, 1.0)
+                    if both_hold_start is None:
+                        both_hold_start = now
+                    held = now - both_hold_start
+                    eye_state["both_hold"] = min(held / HOLD_ALWAYS_SECS, 1.0)
                     if held >= HOLD_ALWAYS_SECS:
                         result_q.put("always_allow"); return
+                    continue   # don't count single-eye gestures while both are closed
                 else:
-                    if r_was_closed:
-                        # Short close → counts as one wink
-                        if r_hold_start and (now - r_hold_start) < HOLD_ALWAYS_SECS:
-                            if r_window_start is None or (now - r_window_start) > DOUBLE_WINK_WINDOW:
-                                r_wink_count, r_window_start = 1, now
-                            else:
-                                r_wink_count += 1
-                            eye_state["r_count"] = r_wink_count
-                            if r_wink_count >= 2:
-                                result_q.put("allow"); return
-                    elif r_window_start and (now - r_window_start) > DOUBLE_WINK_WINDOW:
-                        r_wink_count = 0; r_window_start = None
-                        eye_state["r_count"] = 0
-                    r_hold_start = None
-                    eye_state["r_hold"] = 0.0
-                r_was_closed = r_winking
+                    both_hold_start = None
+                    eye_state["both_hold"] = 0.0
+
+                # ── Right eye double-wink → ALLOW ────────────────────────
+                # Transition: was closed last frame, open now, other eye was open → wink
+                if r_prev and not r_cls and l_score < WINK_OPEN_MAX:
+                    if r_window_start is None or (now - r_window_start) > DOUBLE_WINK_WINDOW:
+                        r_wink_count, r_window_start = 1, now
+                    else:
+                        r_wink_count += 1
+                    eye_state["r_count"] = r_wink_count
+                    if r_wink_count >= 2:
+                        result_q.put("allow"); return
+                elif not r_cls and r_window_start and (now - r_window_start) > DOUBLE_WINK_WINDOW:
+                    r_wink_count = 0; r_window_start = None
+                    eye_state["r_count"] = 0
 
                 # ── Left eye double-wink → REJECT ────────────────────────
-                l_winking = l_cls and r_score < WINK_OPEN_MAX
-                if not l_winking and l_was_closed:
+                if l_prev and not l_cls and r_score < WINK_OPEN_MAX:
                     if l_window_start is None or (now - l_window_start) > DOUBLE_WINK_WINDOW:
                         l_wink_count, l_window_start = 1, now
                     else:
@@ -248,10 +255,9 @@ def _detect() -> None:
                     eye_state["l_count"] = l_wink_count
                     if l_wink_count >= 2:
                         result_q.put("block"); return
-                elif not l_winking and l_window_start and (now - l_window_start) > DOUBLE_WINK_WINDOW:
+                elif not l_cls and l_window_start and (now - l_window_start) > DOUBLE_WINK_WINDOW:
                     l_wink_count = 0; l_window_start = None
                     eye_state["l_count"] = 0
-                l_was_closed = l_winking
 
     finally:
         cap.release()
@@ -325,18 +331,21 @@ class Overlay:
                                 bg=BG, fg=DIM, font=("Helvetica", 16))
         self.r_dots.grid(row=2, column=2, padx=40, pady=(0, 2))
 
-        # Hold progress bar under right eye (fills as you hold the wink)
-        BAR_W = 80
-        bar_bg = tk.Frame(ef, bg=DIM, width=BAR_W, height=5)
-        bar_bg.grid(row=3, column=2, padx=40, pady=(0, 6))
-        bar_bg.grid_propagate(False)
-        self.r_hold_bar = tk.Frame(bar_bg, bg=ACCENT, height=5, width=0)
-        self.r_hold_bar.place(x=0, y=0)
+        # Hold progress bar centered (fills as you hold both eyes closed)
+        BAR_W = 160
+        bar_frame = tk.Frame(r, bg=BG)
+        bar_frame.pack(pady=(0, 4))
+        self._lbl(bar_frame, "Both eyes closed:", fg=MUTED, size=9).pack(side="left", padx=(0, 6))
+        bar_bg = tk.Frame(bar_frame, bg=DIM, width=BAR_W, height=5)
+        bar_bg.pack(side="left")
+        bar_bg.pack_propagate(False)
+        self.both_hold_bar = tk.Frame(bar_bg, bg=ACCENT, height=5, width=0)
+        self.both_hold_bar.place(x=0, y=0)
 
         # Instructions (two lines for clarity)
         self._lbl(r, "Right ×2 → Allow   |   Left ×2 → Reject",
                   fg=MUTED, size=10).pack()
-        self._lbl(r, "Hold right wink 2s → Always allow",
+        self._lbl(r, "Close both eyes 1s → Always allow",
                   fg=ACCENT, size=10).pack()
 
         # Always allow button
@@ -376,7 +385,7 @@ class Overlay:
                                fg=RED   if s["l_count"] > 0 else DIM)
             self.r_dots.config(text=self._dots_str(s["r_count"]),
                                fg=GREEN if s["r_count"] > 0 else DIM)
-            self.r_hold_bar.config(width=int(s["r_hold"] * 80))
+            self.both_hold_bar.config(width=int(s["both_hold"] * 160))
             self.status.config(text=f"Waiting for gesture…  {remaining:.0f}s", fg=MUTED)
         else:
             self.l_lbl.config(text="?", fg=MUTED)
@@ -396,7 +405,7 @@ class Overlay:
     def _finish(self, result: str):
         if result == "always_allow":
             self.status.config(text="✅  ALWAYS ALLOWED", fg=ACCENT)
-            self.r_hold_bar.config(width=80, bg=ACCENT)
+            self.both_hold_bar.config(width=160, bg=ACCENT)
         elif result == "allow":
             self.status.config(text="✅  ALLOWED", fg=GREEN)
             self.r_dots.config(text=f"{self.DOT_FILLED} {self.DOT_FILLED}", fg=GREEN)
