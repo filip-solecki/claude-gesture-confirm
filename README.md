@@ -1,22 +1,23 @@
 # Claude Gesture Confirm
 
-Approve or reject [Claude Code](https://claude.ai/code) tool requests with a blink or wink — no keyboard needed.
+Approve or reject [Claude Code](https://claude.ai/code) tool requests with eye gestures — no keyboard needed.
 
-When Claude wants to run a tool (bash command, file edit, web fetch, etc.), a small overlay appears in the top-right corner of your screen. Look at your camera and gesture:
+When Claude wants to run a tool (bash command, file edit, web fetch, etc.), an overlay appears at the top-center of your screen. Look at the camera and gesture:
 
 | Gesture | Action |
 |---|---|
-| **Blink** (both eyes) | ✅ Allow |
-| **Left wink** (left eye only) | ❌ Reject |
+| **Double right wink** (×2 within 1 s) | ✅ Allow |
+| **Double left wink** (×2 within 1 s) | ❌ Reject |
+| **Both eyes closed for 1 s** | ✅ Always allow (saves to allowlist) |
 | No gesture for 30 s | ❌ Reject (safe default) |
 
-![overlay screenshot placeholder](https://placehold.co/390x230/111827/6366f1?text=Claude+needs+permission)
+Natural blinks are ignored. Previously always-allowed commands skip the overlay entirely.
 
 ## Requirements
 
-- macOS (uses AVFoundation for camera)
+- macOS (uses AVFoundation for camera access)
 - Python 3.9+
-- Camera access granted to your terminal app
+- Camera permission granted to your terminal app
 
 ## Install
 
@@ -34,7 +35,7 @@ bash setup.sh
 
 ### Camera permission
 
-On first run, macOS will prompt for camera access for your terminal app (Terminal, iTerm2, Warp, etc.). Grant it once in **System Settings → Privacy & Security → Camera**.
+On first run macOS will prompt for camera access for your terminal app (Terminal, iTerm2, Warp, etc.). Grant it once in **System Settings → Privacy & Security → Camera**.
 
 ## Test
 
@@ -42,32 +43,45 @@ On first run, macOS will prompt for camera access for your terminal app (Termina
 echo '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' | python3 ~/.claude/gesture_confirm.py
 ```
 
-The overlay should appear. Blink to allow, left wink to reject.
+The overlay should appear. Double right wink to allow, double left wink to reject.
 
 ## How it works
 
-Claude Code supports [hooks](https://docs.claude.ai/en/docs/claude-code/hooks) — shell commands that run before tool execution. The `PreToolUse` hook in `~/.claude/settings.json` calls `gesture_confirm.py` for every tool call.
+Claude Code supports [hooks](https://docs.claude.ai/en/docs/claude-code/hooks) — shell commands that run before every tool execution. The `PreToolUse` hook in `~/.claude/settings.json` calls `gesture_confirm.py`.
 
 The script:
-1. Reads tool info from stdin (name + input preview)
-2. Opens the camera with OpenCV + AVFoundation
-3. Runs MediaPipe Face Landmarker (VIDEO mode) to track `eyeBlinkLeft` / `eyeBlinkRight` blendshape scores in real time
-4. Detects blink (both > 0.35) or left wink (left > 0.35 and right < 0.10)
-5. Outputs `{"hookSpecificOutput": {"permissionDecision": "allow"|"deny", ...}}` and exits
+1. Reads tool info from stdin (tool name + a one-line preview of what it will do)
+2. Checks the allowlist — if the command was previously always-allowed, exits immediately
+3. Opens the camera with OpenCV + AVFoundation
+4. Runs MediaPipe Face Landmarker (VIDEO mode) tracking `eyeBlinkLeft` / `eyeBlinkRight` blendshape scores
+5. Uses hysteresis to debounce scores and detect double-wink or both-eyes-hold gestures
+6. Outputs `{"hookSpecificOutput": {"permissionDecision": "allow"|"deny"}}` and exits
 
-The overlay is a frameless `tkinter` window that shows live eye state (● open / — closed) and a countdown timer.
+The overlay is a frameless `tkinter` window (always on top) showing live eye state and a countdown timer.
 
 ## Configuration
 
-Edit the constants at the top of `gesture_confirm.py`:
+Edit the constants near the top of `gesture_confirm.py`:
 
 | Constant | Default | Description |
 |---|---|---|
-| `TIMEOUT` | `30` | Seconds before auto-reject |
-| `BLINK_THRESHOLD` | `0.35` | Blendshape score to count as closed |
-| `WINK_OPEN_MAX` | `0.10` | Max score for "open" eye in wink detection |
-| `FRAMES_NEEDED` | `2` | Consecutive frames to confirm gesture |
+| `TIMEOUT` | `30` | Seconds before auto-reject if no gesture |
+| `BLINK_CLOSE` | `0.40` | Blendshape score that marks an eye as closed |
+| `BLINK_OPEN` | `0.20` | Score that marks an eye as open again (hysteresis) |
+| `WINK_OPEN_MAX` | `0.30` | Max score the other eye may have during a wink |
+| `DOUBLE_WINK_WINDOW` | `1.0` | Max seconds between the two winks of a double-wink |
+| `HOLD_ALWAYS_SECS` | `1.0` | Seconds to hold both eyes closed to trigger always-allow |
+
+## Allowlist
+
+Approved-always entries are stored in `~/.claude/gesture_confirm_allowlist.json`.
+
+- **Bash** commands are matched by exact command string
+- **Other tools** (Write, Edit, etc.) are matched by tool name alone
+
+To clear the allowlist: `rm ~/.claude/gesture_confirm_allowlist.json`
 
 ## Uninstall
 
-Remove the `PreToolUse` entry from `~/.claude/settings.json` and delete `~/.claude/gesture_confirm.py` and `~/.claude/face_landmarker.task`.
+1. Remove the `PreToolUse` block from `~/.claude/settings.json`
+2. Delete `~/.claude/gesture_confirm.py` and `~/.claude/face_landmarker.task`

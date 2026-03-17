@@ -2,18 +2,17 @@
 """
 Claude Code – Gesture Confirmation Hook
 ────────────────────────────────────────
-Double right wink (×2 within 1 s)   → ALLOW
-Double left wink  (×2 within 1 s)   → REJECT
-Both eyes closed for 1 s            → ALLOW + add to allowlist
-Natural blink (both eyes, < 1 s)    → ignored
-Click "Always allow"                → ALLOW + add to allowlist
-Timeout (30 s)                      → REJECT  (safe default)
+Double right wink  (×2 within 1 s)  →  ALLOW
+Double left wink   (×2 within 1 s)  →  REJECT
+Both eyes closed   (hold 1 s)       →  ALLOW + save to allowlist
+Natural blink      (< 1 s)          →  ignored
+Timeout            (30 s)           →  REJECT (safe default)
 
-Allowlist stored in: ~/.claude/gesture_confirm_allowlist.json
-  - Bash entries matched by exact command string
-  - Other tools matched by tool name
+Allowlist: ~/.claude/gesture_confirm_allowlist.json
+  Bash   – matched by exact command string
+  Others – matched by tool name
 
-Install deps:  pip install mediapipe opencv-python
+Setup: pip install mediapipe opencv-python
 """
 
 import os
