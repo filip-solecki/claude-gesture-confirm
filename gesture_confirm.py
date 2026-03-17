@@ -109,6 +109,7 @@ TIMEOUT            = 30    # seconds before auto-reject if no gesture
 BLINK_THRESHOLD    = 0.35  # MediaPipe eyeBlink blendshape score → eye "closed"
 WINK_OPEN_MAX      = 0.30  # the OTHER eye must stay below this to confirm a wink
 DOUBLE_WINK_WINDOW = 1.0   # max seconds between the two winks of a double-wink
+HOLD_ALWAYS_SECS   = 2.0   # seconds to hold right wink → always allow
 MODEL_PATH         = os.path.expanduser("~/.claude/face_landmarker.task")
 
 # ── UI colours (dark theme) ───────────────────────────────────────────────────
@@ -124,11 +125,12 @@ DIM    = "#374151"
 result_q: "queue.Queue[str]" = queue.Queue()
 
 eye_state: dict = {
-    "face":    False,
-    "left":    None,
-    "right":   None,
-    "l_count": 0,
-    "r_count": 0,
+    "face":      False,
+    "left":      None,
+    "right":     None,
+    "l_count":   0,
+    "r_count":   0,
+    "r_hold":    0.0,   # 0.0–1.0 progress toward always-allow hold
 }
 
 
@@ -168,6 +170,7 @@ def _detect() -> None:
     r_was_closed   = l_was_closed   = False
     r_wink_count   = l_wink_count   = 0
     r_window_start = l_window_start = None
+    r_hold_start   = None   # when the current right-eye close started
     t0 = time.time()
 
     try:
@@ -208,19 +211,31 @@ def _detect() -> None:
                     eye_state["r_count"] = eye_state["l_count"] = 0
                     continue
 
-                # ── Right eye double-wink → ALLOW ────────────────────────
+                # ── Right eye: double-wink → ALLOW, hold 2s → ALWAYS ALLOW ──
                 r_winking = r_cls and l_score < WINK_OPEN_MAX
-                if not r_winking and r_was_closed:
-                    if r_window_start is None or (now - r_window_start) > DOUBLE_WINK_WINDOW:
-                        r_wink_count, r_window_start = 1, now
-                    else:
-                        r_wink_count += 1
-                    eye_state["r_count"] = r_wink_count
-                    if r_wink_count >= 2:
-                        result_q.put("allow"); return
-                elif not r_winking and r_window_start and (now - r_window_start) > DOUBLE_WINK_WINDOW:
-                    r_wink_count = 0; r_window_start = None
-                    eye_state["r_count"] = 0
+                if r_winking:
+                    if r_hold_start is None:
+                        r_hold_start = now
+                    held = now - r_hold_start
+                    eye_state["r_hold"] = min(held / HOLD_ALWAYS_SECS, 1.0)
+                    if held >= HOLD_ALWAYS_SECS:
+                        result_q.put("always_allow"); return
+                else:
+                    if r_was_closed:
+                        # Short close → counts as one wink
+                        if r_hold_start and (now - r_hold_start) < HOLD_ALWAYS_SECS:
+                            if r_window_start is None or (now - r_window_start) > DOUBLE_WINK_WINDOW:
+                                r_wink_count, r_window_start = 1, now
+                            else:
+                                r_wink_count += 1
+                            eye_state["r_count"] = r_wink_count
+                            if r_wink_count >= 2:
+                                result_q.put("allow"); return
+                    elif r_window_start and (now - r_window_start) > DOUBLE_WINK_WINDOW:
+                        r_wink_count = 0; r_window_start = None
+                        eye_state["r_count"] = 0
+                    r_hold_start = None
+                    eye_state["r_hold"] = 0.0
                 r_was_closed = r_winking
 
                 # ── Left eye double-wink → REJECT ────────────────────────
@@ -305,14 +320,24 @@ class Overlay:
         # Wink count dots
         self.l_dots = tk.Label(ef, text=f"{self.DOT_EMPTY} {self.DOT_EMPTY}",
                                 bg=BG, fg=DIM, font=("Helvetica", 16))
-        self.l_dots.grid(row=2, column=0, padx=40, pady=(0, 6))
+        self.l_dots.grid(row=2, column=0, padx=40, pady=(0, 2))
         self.r_dots = tk.Label(ef, text=f"{self.DOT_EMPTY} {self.DOT_EMPTY}",
                                 bg=BG, fg=DIM, font=("Helvetica", 16))
-        self.r_dots.grid(row=2, column=2, padx=40, pady=(0, 6))
+        self.r_dots.grid(row=2, column=2, padx=40, pady=(0, 2))
 
-        # Instructions
-        self._lbl(r, "Right ×2 → ALLOW   |   Left ×2 → REJECT",
+        # Hold progress bar under right eye (fills as you hold the wink)
+        BAR_W = 80
+        bar_bg = tk.Frame(ef, bg=DIM, width=BAR_W, height=5)
+        bar_bg.grid(row=3, column=2, padx=40, pady=(0, 6))
+        bar_bg.grid_propagate(False)
+        self.r_hold_bar = tk.Frame(bar_bg, bg=ACCENT, height=5, width=0)
+        self.r_hold_bar.place(x=0, y=0)
+
+        # Instructions (two lines for clarity)
+        self._lbl(r, "Right ×2 → Allow   |   Left ×2 → Reject",
                   fg=MUTED, size=10).pack()
+        self._lbl(r, "Hold right wink 2s → Always allow",
+                  fg=ACCENT, size=10).pack()
 
         # Always allow button
         tk.Button(
@@ -351,6 +376,7 @@ class Overlay:
                                fg=RED   if s["l_count"] > 0 else DIM)
             self.r_dots.config(text=self._dots_str(s["r_count"]),
                                fg=GREEN if s["r_count"] > 0 else DIM)
+            self.r_hold_bar.config(width=int(s["r_hold"] * 80))
             self.status.config(text=f"Waiting for gesture…  {remaining:.0f}s", fg=MUTED)
         else:
             self.l_lbl.config(text="?", fg=MUTED)
@@ -368,7 +394,10 @@ class Overlay:
         self.root.after(80, self._poll)
 
     def _finish(self, result: str):
-        if result in ("allow", "always_allow"):
+        if result == "always_allow":
+            self.status.config(text="✅  ALWAYS ALLOWED", fg=ACCENT)
+            self.r_hold_bar.config(width=80, bg=ACCENT)
+        elif result == "allow":
             self.status.config(text="✅  ALLOWED", fg=GREEN)
             self.r_dots.config(text=f"{self.DOT_FILLED} {self.DOT_FILLED}", fg=GREEN)
         else:
