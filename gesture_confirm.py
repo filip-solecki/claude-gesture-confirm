@@ -112,6 +112,7 @@ BLINK_OPEN         = 0.20  # score falls below this → eye transitions back to 
 WINK_OPEN_MAX      = 0.30  # the OTHER eye must stay below this to confirm a wink
 DOUBLE_WINK_WINDOW = 1.0   # max seconds between the two winks of a double-wink
 HOLD_ALWAYS_SECS   = 1.0   # seconds to hold both eyes closed → always allow
+LOOK_DOWN_MAX      = 0.40  # eyeLookDown score above this → user is looking away, ignore
 MODEL_PATH         = os.path.expanduser("~/.claude/face_landmarker.task")
 
 # ── UI colours (dark theme) ───────────────────────────────────────────────────
@@ -203,6 +204,15 @@ def _detect() -> None:
                 l_score = bs.get("eyeBlinkLeft",  0.0)
                 r_score = bs.get("eyeBlinkRight", 0.0)
                 now     = time.time()
+
+                # Skip gesture detection if the user is looking down (e.g. at keyboard).
+                # eyeLookDown blendshapes capture downward gaze without being a real blink.
+                l_down = bs.get("eyeLookDownLeft",  0.0)
+                r_down = bs.get("eyeLookDownRight", 0.0)
+                if l_down > LOOK_DOWN_MAX or r_down > LOOK_DOWN_MAX:
+                    both_hold_start = None
+                    eye_state["both_hold"] = 0.0
+                    continue
 
                 # Hysteresis: transition closed→open only when score drops below BLINK_OPEN
                 if r_closed:
