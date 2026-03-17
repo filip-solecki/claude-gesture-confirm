@@ -281,11 +281,11 @@ class Overlay:
         r.attributes("-alpha", 0.93)
         r.overrideredirect(True)
 
-        W = 480
-        sw = r.winfo_screenwidth()
-        r.geometry(f"+{(sw - W) // 2}+20")
-
         self._build()
+        r.update_idletasks()
+        sw = r.winfo_screenwidth()
+        w = r.winfo_reqwidth()
+        r.geometry(f"+{sw - w}+0")
         threading.Thread(target=_detect, daemon=True).start()
         self._poll()
         r.mainloop()
