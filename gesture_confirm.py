@@ -109,7 +109,7 @@ TIMEOUT            = 30    # seconds before auto-reject if no gesture
 BLINK_CLOSE        = 0.40  # score rises above this → eye transitions to "closed"
 BLINK_OPEN         = 0.20  # score falls below this → eye transitions back to "open"
 WINK_OPEN_MAX      = 0.30  # the OTHER eye must stay below this to confirm a wink
-DOUBLE_WINK_WINDOW = 1.0   # max seconds between the two winks of a double-wink
+DOUBLE_WINK_WINDOW = 2.5   # max seconds between the two winks of a double-wink
 HOLD_ALWAYS_SECS   = 1.0   # seconds to hold both eyes closed → always allow
 MODEL_PATH         = os.path.expanduser("~/.claude/face_landmarker.task")
 
@@ -281,7 +281,7 @@ class Overlay:
         r.attributes("-alpha", 0.93)
         r.overrideredirect(True)
 
-        W = 400
+        W = 480
         sw = r.winfo_screenwidth()
         r.geometry(f"+{(sw - W) // 2}+20")
 
@@ -303,10 +303,10 @@ class Overlay:
         # Tool name + preview
         self._lbl(r, "⚡  Claude needs permission",
                   fg=FG, size=14, bold=True).pack(anchor="w", pady=(12, 2), **pad)
-        self._lbl(r, tool_name, fg=ACCENT, size=12, bold=True).pack(anchor="w", **pad)
+        self._lbl(r, tool_name, fg=ACCENT, size=13, bold=True).pack(anchor="w", **pad)
         if tool_preview:
-            self._lbl(r, tool_preview, fg=MUTED, size=11).pack(
-                anchor="w", pady=(2, 10), **pad)
+            self._lbl(r, tool_preview, fg=FG, size=11, wraplength=440).pack(
+                anchor="w", pady=(2, 10), padx=18)
 
         # Eye indicators
         ef = tk.Frame(r, bg=BG)
@@ -342,20 +342,21 @@ class Overlay:
         self.both_hold_bar.place(x=0, y=0)
 
         # Instructions (two lines for clarity)
-        self._lbl(r, "Right ×2 → Allow   |   Left ×2 → Reject",
-                  fg=MUTED, size=10).pack()
-        self._lbl(r, "Close both eyes 1s → Always allow",
-                  fg=ACCENT, size=10).pack()
+        self._lbl(r, "👁 Right ×2 → Allow   |   👁 Left ×2 → Reject",
+                  fg=FG, size=11, bold=True).pack(pady=(4, 0))
+        self._lbl(r, "Close both eyes 1 s → Always allow",
+                  fg=ACCENT, size=10).pack(pady=(2, 0))
 
-        # Always allow button
+        # Always allow button — prominent
         tk.Button(
-            r, text="Always allow this",
-            bg=DIM, fg=MUTED, relief="flat",
-            font=("Helvetica", 10),
-            activebackground=ACCENT, activeforeground=FG,
+            r, text="✅  Always allow this",
+            bg=ACCENT, fg=FG, relief="flat",
+            font=("Helvetica", 11, "bold"),
+            activebackground="#4f52d3", activeforeground=FG,
+            padx=14, pady=6,
             cursor="hand2",
             command=self._always_allow,
-        ).pack(pady=(6, 4))
+        ).pack(pady=(10, 4))
 
         # Status / timer
         self.status = self._lbl(r, f"Looking for face…  {TIMEOUT}s", fg=MUTED, size=10)
