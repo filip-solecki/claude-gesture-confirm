@@ -2,9 +2,10 @@
 """
 Claude Code – Gesture Confirmation Hook
 ────────────────────────────────────────
-Blink (both eyes close & reopen) → ALLOW
-Left wink (left eye only)         → REJECT
-Timeout (30 s)                    → REJECT  (safe default)
+Right wink (right eye only) → ALLOW
+Left wink  (left eye only)  → REJECT
+Blink (both eyes)           → ignored  (natural blink, no trigger)
+Timeout (30 s)              → REJECT   (safe default)
 
 Install deps:  pip install mediapipe opencv-python
 """
@@ -61,7 +62,7 @@ import tkinter as tk  # noqa: E402
 # ── Constants ─────────────────────────────────────────────────────────────────
 TIMEOUT         = 30     # seconds until auto-reject
 BLINK_THRESHOLD = 0.35   # blendshape score above this → eye closed
-WINK_OPEN_MAX   = 0.10   # other eye must be BELOW this score to confirm wink
+WINK_OPEN_MAX   = 0.30   # other eye must be BELOW this score to confirm wink
 FRAMES_NEEDED   = 2      # consecutive closed frames to confirm gesture
 MODEL_PATH      = "/Users/filipsolecki/.claude/face_landmarker.task"
 
@@ -107,7 +108,7 @@ def _detect():
         min_tracking_confidence=0.5,
     )
 
-    blink_f = wink_f = 0
+    r_wink_f = l_wink_f = 0
     t0 = time.time()
 
     try:
@@ -125,7 +126,7 @@ def _detect():
 
                 if not result.face_blendshapes:
                     eye_state.update(left=None, right=None, face=False)
-                    blink_f = wink_f = 0
+                    r_wink_f = l_wink_f = 0
                     continue
 
                 bs      = {b.category_name: b.score for b in result.face_blendshapes[0]}
@@ -135,16 +136,23 @@ def _detect():
                 r_cls   = r_score > BLINK_THRESHOLD
                 eye_state.update(left=l_cls, right=r_cls, face=True)
 
-                if l_cls and r_cls:
-                    blink_f += 1; wink_f = 0
+                both_closed = l_cls and r_cls
+
+                if both_closed:
+                    # Natural blink — ignore, reset counters
+                    r_wink_f = l_wink_f = 0
+                elif r_cls and l_score < WINK_OPEN_MAX:
+                    # Right wink (right eye closed, left clearly open) → ALLOW
+                    r_wink_f += 1; l_wink_f = 0
                 elif l_cls and r_score < WINK_OPEN_MAX:
-                    wink_f += 1; blink_f = 0
+                    # Left wink (left eye closed, right clearly open) → REJECT
+                    l_wink_f += 1; r_wink_f = 0
                 else:
-                    if blink_f >= FRAMES_NEEDED:
+                    if r_wink_f >= FRAMES_NEEDED:
                         result_q.put("allow"); return
-                    if wink_f  >= FRAMES_NEEDED:
+                    if l_wink_f >= FRAMES_NEEDED:
                         result_q.put("block"); return
-                    blink_f = wink_f = 0
+                    r_wink_f = l_wink_f = 0
     finally:
         cap.release()
 
@@ -213,7 +221,7 @@ class Overlay:
         self.r_lbl.grid(row=1, column=2, padx=36, pady=4)
 
         # instructions
-        self._lbl(r, "Blink both → ALLOW   |   Left wink → REJECT",
+        self._lbl(r, "Right wink → ALLOW   |   Left wink → REJECT",
                   fg=MUTED, size=9).pack(pady=(4, 2))
 
         # status
