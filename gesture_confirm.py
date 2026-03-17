@@ -5,12 +5,14 @@ Claude Code – Gesture Confirmation Hook
 Double right wink (×2 within 1 s) → ALLOW
 Double left wink  (×2 within 1 s) → REJECT
 Natural blink (both eyes)          → ignored
+Click "Always allow"               → ALLOW + add to allowlist
 Timeout (30 s)                     → REJECT  (safe default)
 
-Install deps:  pip install mediapipe opencv-python
+Allowlist stored in: ~/.claude/gesture_confirm_allowlist.json
+  - Bash entries matched by exact command string
+  - Other tools matched by tool name
 
-Hook receives tool info as JSON on stdin and outputs a Claude Code
-permissionDecision JSON on stdout. Runs as a PreToolUse hook.
+Install deps:  pip install mediapipe opencv-python
 """
 
 import os
@@ -21,7 +23,6 @@ import threading
 import queue
 
 # ── Read tool info from stdin ─────────────────────────────────────────────────
-# Claude Code passes {"tool_name": "...", "tool_input": {...}} via stdin.
 try:
     tool_info = json.loads(sys.stdin.read())
 except Exception:
@@ -30,24 +31,60 @@ except Exception:
 tool_name  = tool_info.get("tool_name", "Unknown")
 tool_input = tool_info.get("tool_input", {})
 
+# ── Allowlist ─────────────────────────────────────────────────────────────────
+ALLOWLIST_PATH = os.path.expanduser("~/.claude/gesture_confirm_allowlist.json")
 
-def _preview(name, inp, limit=200):
-    """Format a human-readable preview of the tool input."""
-    if name == "Bash" and "command" in inp:
-        return "$ " + inp["command"].strip()
-    if name == "Write" and "file_path" in inp:
-        lines = inp.get("content", "").splitlines()
-        preview = "\n".join(lines[:6])
-        if len(lines) > 6:
-            preview += f"\n… ({len(lines)} lines total)"
-        return f"{inp['file_path']}\n{preview}"
-    if name == "Edit" and "file_path" in inp:
-        return f"{inp['file_path']}\n- {inp.get('old_string','')[:80].strip()}\n+ {inp.get('new_string','')[:80].strip()}"
+
+def _load_allowlist() -> list:
+    try:
+        with open(ALLOWLIST_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _save_to_allowlist() -> None:
+    """Add the current tool/command to the allowlist and persist it."""
+    entries = _load_allowlist()
+    entry = {"tool": tool_name}
+    if tool_name == "Bash" and "command" in tool_input:
+        entry["command"] = tool_input["command"].strip()
+    if entry not in entries:
+        entries.append(entry)
+    with open(ALLOWLIST_PATH, "w") as f:
+        json.dump(entries, f, indent=2)
+
+
+def _is_allowlisted() -> bool:
+    """Return True if this tool call should be auto-allowed without showing the overlay."""
+    for entry in _load_allowlist():
+        if entry.get("tool") != tool_name:
+            continue
+        # Bash: match by exact command
+        if tool_name == "Bash":
+            if entry.get("command") == tool_input.get("command", "").strip():
+                return True
+        else:
+            # Other tools: match by tool name alone
+            return True
+    return False
+
+
+# ── Short preview line for the overlay ───────────────────────────────────────
+def _preview(name, inp) -> str:
+    """One concise line describing what the tool will do."""
+    if name == "Bash":
+        cmd = inp.get("command", "").replace("\n", " ").strip()
+        return f"$ {cmd[:70]}{'…' if len(cmd) > 70 else ''}"
+    if name in ("Write", "Edit"):
+        return inp.get("file_path", "")
+    if name == "WebFetch":
+        url = inp.get("url", "")
+        return url[:80] + ("…" if len(url) > 80 else "")
     for key in ("file_path", "pattern", "url"):
         if key in inp:
             return inp[key]
-    s = json.dumps(inp, indent=2)
-    return (s[:limit] + "…") if len(s) > limit else s
+    return ""
 
 
 tool_preview = _preview(tool_name, tool_input)
@@ -58,7 +95,6 @@ try:
     import mediapipe as mp
 except ImportError:
     sys.stderr.write("[gesture_confirm] run: pip install mediapipe opencv-python\n")
-    # Fail open: if deps are missing don't block Claude entirely.
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": "allow",
@@ -72,35 +108,31 @@ import tkinter as tk
 TIMEOUT            = 30    # seconds before auto-reject if no gesture
 BLINK_THRESHOLD    = 0.35  # MediaPipe eyeBlink blendshape score → eye "closed"
 WINK_OPEN_MAX      = 0.30  # the OTHER eye must stay below this to confirm a wink
-                            # (prevents a normal blink from counting as a wink)
 DOUBLE_WINK_WINDOW = 1.0   # max seconds between the two winks of a double-wink
 MODEL_PATH         = os.path.expanduser("~/.claude/face_landmarker.task")
 
 # ── UI colours (dark theme) ───────────────────────────────────────────────────
-BG     = "#111827"   # background
-FG     = "#e5e7eb"   # primary text
-ACCENT = "#6366f1"   # indigo highlight
-GREEN  = "#22c55e"   # allow / open eye
-RED    = "#ef4444"   # reject / closed eye
-MUTED  = "#6b7280"   # secondary text
-DIM    = "#374151"   # inactive dots
+BG     = "#111827"
+FG     = "#e5e7eb"
+ACCENT = "#6366f1"
+GREEN  = "#22c55e"
+RED    = "#ef4444"
+MUTED  = "#6b7280"
+DIM    = "#374151"
 
 # ── Shared state between detection thread and UI thread ──────────────────────
 result_q: "queue.Queue[str]" = queue.Queue()
 
-# Updated by the detection thread, read by the UI poll loop (80 ms interval).
-# CPython's GIL makes these plain-dict updates safe without an explicit lock.
 eye_state: dict = {
-    "face":    False,   # whether a face is currently detected
-    "left":    None,    # True = left eye closed, False = open, None = no face
+    "face":    False,
+    "left":    None,
     "right":   None,
-    "l_count": 0,       # completed winks in the current window (0 or 1)
+    "l_count": 0,
     "r_count": 0,
 }
 
 
 def _send_decision(decision: str, reason: str) -> None:
-    """Print the Claude Code hook decision JSON to stdout."""
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,
@@ -108,24 +140,20 @@ def _send_decision(decision: str, reason: str) -> None:
     }}))
 
 
-# ── Gesture detection (runs in a background thread) ──────────────────────────
+# ── Gesture detection (background thread) ────────────────────────────────────
 def _detect() -> None:
     """
-    Capture webcam frames, run MediaPipe Face Landmarker, and detect
-    double-wink gestures via eyeBlink blendshape scores.
-
-    A "wink" is one close→open cycle of a single eye while the other eye
-    stays clearly open (score < WINK_OPEN_MAX).  Two winks of the same eye
-    within DOUBLE_WINK_WINDOW seconds fires the decision.
+    Capture webcam frames and detect double-wink gestures via MediaPipe
+    eyeBlink blendshape scores.  Puts "allow" or "block" into result_q.
     """
     from mediapipe.tasks import python as mp_tasks
     from mediapipe.tasks.python import vision as mp_vision
 
     cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
     if not cap.isOpened():
-        result_q.put("allow")   # no camera available — fail open
+        result_q.put("allow")
         return
-    time.sleep(0.3)             # brief warmup so first frames aren't corrupt
+    time.sleep(0.3)
 
     options = mp_vision.FaceLandmarkerOptions(
         base_options=mp_tasks.BaseOptions(model_asset_path=MODEL_PATH),
@@ -137,10 +165,9 @@ def _detect() -> None:
         min_tracking_confidence=0.5,
     )
 
-    # Per-eye tracking variables
-    r_was_closed   = l_was_closed   = False   # eye state in previous frame
-    r_wink_count   = l_wink_count   = 0       # completed winks in current window
-    r_window_start = l_window_start = None    # timestamp of first wink in window
+    r_was_closed   = l_was_closed   = False
+    r_wink_count   = l_wink_count   = 0
+    r_window_start = l_window_start = None
     t0 = time.time()
 
     try:
@@ -157,7 +184,6 @@ def _detect() -> None:
                 result = lmk.detect_for_video(mp_img, ts_ms)
 
                 if not result.face_blendshapes:
-                    # No face — reset all state and update overlay
                     eye_state.update(face=False, left=None, right=None,
                                      r_count=0, l_count=0)
                     r_was_closed = l_was_closed = False
@@ -165,17 +191,16 @@ def _detect() -> None:
                     r_window_start = l_window_start = None
                     continue
 
-                # Extract per-eye blink scores (0.0 = open, 1.0 = fully closed)
                 bs      = {b.category_name: b.score for b in result.face_blendshapes[0]}
-                l_score = bs.get("eyeBlinkLeft",  0.0)   # subject's left eye
-                r_score = bs.get("eyeBlinkRight", 0.0)   # subject's right eye
+                l_score = bs.get("eyeBlinkLeft",  0.0)
+                r_score = bs.get("eyeBlinkRight", 0.0)
                 l_cls   = l_score > BLINK_THRESHOLD
                 r_cls   = r_score > BLINK_THRESHOLD
                 now     = time.time()
 
                 eye_state.update(face=True, left=l_cls, right=r_cls)
 
-                # Both eyes closed = natural blink → ignore, reset counters
+                # Both eyes closed = natural blink → ignore
                 if l_cls and r_cls:
                     r_was_closed = l_was_closed = False
                     r_wink_count = l_wink_count = 0
@@ -184,20 +209,16 @@ def _detect() -> None:
                     continue
 
                 # ── Right eye double-wink → ALLOW ────────────────────────
-                # A wink is detected on the rising edge: eye was closed last
-                # frame and is now open (close→open transition).
                 r_winking = r_cls and l_score < WINK_OPEN_MAX
                 if not r_winking and r_was_closed:
-                    # Wink just completed — count it
                     if r_window_start is None or (now - r_window_start) > DOUBLE_WINK_WINDOW:
-                        r_wink_count, r_window_start = 1, now   # start fresh window
+                        r_wink_count, r_window_start = 1, now
                     else:
                         r_wink_count += 1
                     eye_state["r_count"] = r_wink_count
                     if r_wink_count >= 2:
                         result_q.put("allow"); return
                 elif not r_winking and r_window_start and (now - r_window_start) > DOUBLE_WINK_WINDOW:
-                    # Window expired without a second wink — reset
                     r_wink_count = 0; r_window_start = None
                     eye_state["r_count"] = 0
                 r_was_closed = r_winking
@@ -220,21 +241,15 @@ def _detect() -> None:
     finally:
         cap.release()
 
-    result_q.put("block")   # timeout reached → safe default is reject
+    result_q.put("block")   # timeout → reject
 
 
-# ── Overlay UI (runs on the main thread via tkinter) ─────────────────────────
+# ── Overlay UI ────────────────────────────────────────────────────────────────
 class Overlay:
-    """
-    Frameless always-on-top window shown in the top-right corner.
-    Displays the tool name, a live eye-state indicator, wink-count dots,
-    and a countdown timer.  Polls result_q every 80 ms.
-    """
-
-    SYMBOL_OPEN   = "●"   # eye open
-    SYMBOL_CLOSED = "—"   # eye closed
-    DOT_FILLED    = "●"   # wink registered
-    DOT_EMPTY     = "○"   # wink not yet registered
+    SYMBOL_OPEN   = "●"
+    SYMBOL_CLOSED = "—"
+    DOT_FILLED    = "●"
+    DOT_EMPTY     = "○"
 
     def __init__(self):
         self._start = time.time()
@@ -244,11 +259,10 @@ class Overlay:
         r.configure(bg=BG)
         r.attributes("-topmost", True)
         r.attributes("-alpha", 0.93)
-        r.overrideredirect(True)   # remove OS window chrome for a cleaner look
+        r.overrideredirect(True)
 
-        W = 420
+        W = 400
         sw = r.winfo_screenwidth()
-        # Height is determined by content; position top-right
         r.geometry(f"+{sw - W - 20}+20")
 
         self._build()
@@ -256,59 +270,73 @@ class Overlay:
         self._poll()
         r.mainloop()
 
-    def _lbl(self, parent, text, fg=FG, size=11, bold=False, **kw):
+    def _lbl(self, parent, text, fg=FG, size=12, bold=False, **kw):
         return tk.Label(parent, text=text, bg=BG, fg=fg,
                         font=("Helvetica", size, "bold" if bold else "normal"), **kw)
 
     def _build(self):
         r, pad = self.root, dict(padx=18)
 
-        # Coloured accent bar at the top
+        # Accent bar
         tk.Frame(r, bg=ACCENT, height=4).pack(fill="x")
 
-        # Tool info header
+        # Tool name + preview
         self._lbl(r, "⚡  Claude needs permission",
-                  fg=FG, size=12, bold=True).pack(anchor="w", pady=(10, 2), **pad)
-        self._lbl(r, f"Tool: {tool_name}",
-                  fg=ACCENT, size=10, bold=True).pack(anchor="w", **pad)
-        tk.Label(r, text=tool_preview, bg=BG, fg=MUTED,
-                 font=("Helvetica Neue", 9), justify="left",
-                 wraplength=380, anchor="w").pack(anchor="w", pady=(1, 8), **pad)
+                  fg=FG, size=14, bold=True).pack(anchor="w", pady=(12, 2), **pad)
+        self._lbl(r, tool_name, fg=ACCENT, size=12, bold=True).pack(anchor="w", **pad)
+        if tool_preview:
+            self._lbl(r, tool_preview, fg=MUTED, size=11).pack(
+                anchor="w", pady=(2, 10), **pad)
 
-        # Eye indicators grid
+        # Eye indicators
         ef = tk.Frame(r, bg=BG)
-        ef.pack()
-        self._lbl(ef, "YOUR LEFT EYE",  fg=MUTED, size=8).grid(row=0, column=0, padx=36)
-        self._lbl(ef, "YOUR RIGHT EYE", fg=MUTED, size=8).grid(row=0, column=2, padx=36)
+        ef.pack(pady=(0, 4))
+        self._lbl(ef, "LEFT EYE",  fg=MUTED, size=9).grid(row=0, column=0, padx=40)
+        self._lbl(ef, "RIGHT EYE", fg=MUTED, size=9).grid(row=0, column=2, padx=40)
 
         self.l_lbl = tk.Label(ef, text=self.SYMBOL_OPEN, bg=BG, fg=GREEN,
-                               font=("Helvetica", 30, "bold"))
-        self.l_lbl.grid(row=1, column=0, padx=36, pady=2)
-        tk.Label(ef, bg=BG, width=2).grid(row=1, column=1)   # spacer
+                               font=("Helvetica", 32, "bold"))
+        self.l_lbl.grid(row=1, column=0, padx=40, pady=2)
+        tk.Label(ef, bg=BG, width=2).grid(row=1, column=1)
         self.r_lbl = tk.Label(ef, text=self.SYMBOL_OPEN, bg=BG, fg=GREEN,
-                               font=("Helvetica", 30, "bold"))
-        self.r_lbl.grid(row=1, column=2, padx=36, pady=2)
+                               font=("Helvetica", 32, "bold"))
+        self.r_lbl.grid(row=1, column=2, padx=40, pady=2)
 
-        # Wink count dots: ○ ○ → ● ○ after first wink → fires on second
+        # Wink count dots
         self.l_dots = tk.Label(ef, text=f"{self.DOT_EMPTY} {self.DOT_EMPTY}",
-                                bg=BG, fg=DIM, font=("Helvetica", 14))
-        self.l_dots.grid(row=2, column=0, padx=36, pady=(0, 4))
+                                bg=BG, fg=DIM, font=("Helvetica", 16))
+        self.l_dots.grid(row=2, column=0, padx=40, pady=(0, 6))
         self.r_dots = tk.Label(ef, text=f"{self.DOT_EMPTY} {self.DOT_EMPTY}",
-                                bg=BG, fg=DIM, font=("Helvetica", 14))
-        self.r_dots.grid(row=2, column=2, padx=36, pady=(0, 4))
+                                bg=BG, fg=DIM, font=("Helvetica", 16))
+        self.r_dots.grid(row=2, column=2, padx=40, pady=(0, 6))
 
-        self._lbl(r, "Double right wink → ALLOW   |   Double left wink → REJECT",
-                  fg=MUTED, size=9).pack(pady=(4, 2))
+        # Instructions
+        self._lbl(r, "Right ×2 → ALLOW   |   Left ×2 → REJECT",
+                  fg=MUTED, size=10).pack()
 
-        self.status = self._lbl(r, f"Looking for face…  {TIMEOUT}s", fg=MUTED, size=9)
-        self.status.pack(pady=(2, 10))
+        # Always allow button
+        tk.Button(
+            r, text="Always allow this",
+            bg=DIM, fg=MUTED, relief="flat",
+            font=("Helvetica", 10),
+            activebackground=ACCENT, activeforeground=FG,
+            cursor="hand2",
+            command=self._always_allow,
+        ).pack(pady=(6, 4))
+
+        # Status / timer
+        self.status = self._lbl(r, f"Looking for face…  {TIMEOUT}s", fg=MUTED, size=10)
+        self.status.pack(pady=(0, 12))
 
     def _dots_str(self, count):
-        """Return dot string showing how many winks have been registered (max shown: 1)."""
         return f"{self.DOT_FILLED if count >= 1 else self.DOT_EMPTY} {self.DOT_EMPTY}"
 
+    def _always_allow(self):
+        """Save to allowlist and allow immediately."""
+        _save_to_allowlist()
+        result_q.put("always_allow")
+
     def _poll(self):
-        """Called every 80 ms on the main thread to refresh the UI and check for a result."""
         remaining = max(0.0, TIMEOUT - (time.time() - self._start))
         s = eye_state
 
@@ -340,8 +368,7 @@ class Overlay:
         self.root.after(80, self._poll)
 
     def _finish(self, result: str):
-        """Show brief confirmation then exit."""
-        if result == "allow":
+        if result in ("allow", "always_allow"):
             self.status.config(text="✅  ALLOWED", fg=GREEN)
             self.r_dots.config(text=f"{self.DOT_FILLED} {self.DOT_FILLED}", fg=GREEN)
         else:
@@ -353,6 +380,8 @@ class Overlay:
         self.root.destroy()
         if result == "allow":
             _send_decision("allow", "Double right wink – approved by user")
+        elif result == "always_allow":
+            _send_decision("allow", "Added to allowlist – always allowed")
         else:
             _send_decision("deny", "Double left wink or timeout – rejected")
         sys.exit(0)
@@ -360,4 +389,9 @@ class Overlay:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Check allowlist before showing the overlay at all
+    if _is_allowlisted():
+        _send_decision("allow", f"Allowlisted – auto-approved")
+        sys.exit(0)
+
     Overlay()
