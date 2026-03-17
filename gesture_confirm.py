@@ -31,15 +31,22 @@ tool_name  = tool_info.get("tool_name", "Unknown")
 tool_input = tool_info.get("tool_input", {})
 
 
-def _preview(name, inp, limit=54):
-    """Format a short human-readable preview of the tool input."""
+def _preview(name, inp, limit=200):
+    """Format a human-readable preview of the tool input."""
     if name == "Bash" and "command" in inp:
-        return ("$ " + inp["command"].replace("\n", " "))[:limit + 2]
+        return "$ " + inp["command"].strip()
+    if name == "Write" and "file_path" in inp:
+        lines = inp.get("content", "").splitlines()
+        preview = "\n".join(lines[:6])
+        if len(lines) > 6:
+            preview += f"\n… ({len(lines)} lines total)"
+        return f"{inp['file_path']}\n{preview}"
+    if name == "Edit" and "file_path" in inp:
+        return f"{inp['file_path']}\n- {inp.get('old_string','')[:80].strip()}\n+ {inp.get('new_string','')[:80].strip()}"
     for key in ("file_path", "pattern", "url"):
         if key in inp:
-            v = inp[key]
-            return v[-limit:] if len(v) > limit else v
-    s = json.dumps(inp, separators=(",", ":"))
+            return inp[key]
+    s = json.dumps(inp, indent=2)
     return (s[:limit] + "…") if len(s) > limit else s
 
 
@@ -239,9 +246,10 @@ class Overlay:
         r.attributes("-alpha", 0.93)
         r.overrideredirect(True)   # remove OS window chrome for a cleaner look
 
-        W, H = 390, 240
+        W = 420
         sw = r.winfo_screenwidth()
-        r.geometry(f"{W}x{H}+{sw - W - 20}+20")   # top-right corner
+        # Height is determined by content; position top-right
+        r.geometry(f"+{sw - W - 20}+20")
 
         self._build()
         threading.Thread(target=_detect, daemon=True).start()
@@ -263,8 +271,9 @@ class Overlay:
                   fg=FG, size=12, bold=True).pack(anchor="w", pady=(10, 2), **pad)
         self._lbl(r, f"Tool: {tool_name}",
                   fg=ACCENT, size=10, bold=True).pack(anchor="w", **pad)
-        self._lbl(r, tool_preview,
-                  fg=MUTED, size=9).pack(anchor="w", pady=(1, 8), **pad)
+        tk.Label(r, text=tool_preview, bg=BG, fg=MUTED,
+                 font=("Helvetica Neue", 9), justify="left",
+                 wraplength=380, anchor="w").pack(anchor="w", pady=(1, 8), **pad)
 
         # Eye indicators grid
         ef = tk.Frame(r, bg=BG)
