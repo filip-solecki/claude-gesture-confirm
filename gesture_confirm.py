@@ -294,7 +294,7 @@ class Overlay:
 
         W = 400
         sw = r.winfo_screenwidth()
-        r.geometry(f"+{sw - W - 20}+20")
+        r.geometry(f"+{(sw - W) // 2}+20")
 
         self._build()
         threading.Thread(target=_detect, daemon=True).start()
