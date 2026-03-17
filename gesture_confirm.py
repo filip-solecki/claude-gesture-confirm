@@ -112,7 +112,7 @@ BLINK_OPEN         = 0.20  # score falls below this → eye transitions back to 
 WINK_OPEN_MAX      = 0.30  # the OTHER eye must stay below this to confirm a wink
 DOUBLE_WINK_WINDOW = 1.0   # max seconds between the two winks of a double-wink
 HOLD_ALWAYS_SECS   = 1.0   # seconds to hold both eyes closed → always allow
-LOOK_DOWN_MAX      = 0.40  # eyeLookDown score above this → user is looking away, ignore
+LOOK_DOWN_MAX      = 0.70  # eyeLookDown score above this → user is looking away, ignore
 MODEL_PATH         = os.path.expanduser("~/.claude/face_landmarker.task")
 
 # ── UI colours (dark theme) ───────────────────────────────────────────────────
