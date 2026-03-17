@@ -147,8 +147,8 @@ def _send_decision(decision: str, reason: str) -> None:
 # ── Gesture detection (background thread) ────────────────────────────────────
 def _detect() -> None:
     """
-    Capture webcam frames and detect double-wink gestures via MediaPipe
-    eyeBlink blendshape scores.  Puts "allow" or "block" into result_q.
+    Capture webcam frames and detect gestures via MediaPipe eyeBlink blendshapes.
+    Puts "allow", "always_allow", or "block" into result_q.
     """
     from mediapipe.tasks import python as mp_tasks
     from mediapipe.tasks.python import vision as mp_vision
@@ -363,7 +363,9 @@ class Overlay:
         self.status.pack(pady=(0, 12))
 
     def _dots_str(self, count):
-        return f"{self.DOT_FILLED if count >= 1 else self.DOT_EMPTY} {self.DOT_EMPTY}"
+        d1 = self.DOT_FILLED if count >= 1 else self.DOT_EMPTY
+        d2 = self.DOT_FILLED if count >= 2 else self.DOT_EMPTY
+        return f"{d1} {d2}"
 
     def _always_allow(self):
         """Save to allowlist and allow immediately."""
@@ -429,7 +431,7 @@ class Overlay:
 if __name__ == "__main__":
     # Check allowlist before showing the overlay at all
     if _is_allowlisted():
-        _send_decision("allow", f"Allowlisted – auto-approved")
+        _send_decision("allow", "Allowlisted – auto-approved")
         sys.exit(0)
 
     Overlay()
